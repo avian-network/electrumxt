@@ -131,7 +131,7 @@ def test_classify_receive():
                                [TxOutput(1_000, OURS), TxOutput(4_000, THEIRS)])
     prevouts = {(parent_hash, 0): Prevout(hashX(THEIRS), 5_100, THEIRS_ADDRESS)}
     assert classify_tx(coin, OURS_HASHX, tx, prevouts) == \
-        ('receive', 1_000, THEIRS_ADDRESS, 100)
+        ('receive', 1_000, THEIRS_ADDRESS, 100, False)
 
 
 def test_classify_send_nets_change_and_includes_fee():
@@ -141,7 +141,7 @@ def test_classify_send_nets_change_and_includes_fee():
     prevouts = {(parent_hash, 0): Prevout(OURS_HASHX, 1_000, OURS_ADDRESS)}
     # 600 paid away plus the 100 fee left the address
     assert classify_tx(coin, OURS_HASHX, tx, prevouts) == \
-        ('send', 700, THEIRS_ADDRESS, 100)
+        ('send', 700, THEIRS_ADDRESS, 100, False)
 
 
 def test_classify_counterparty_is_the_largest_output():
@@ -150,7 +150,7 @@ def test_classify_counterparty_is_the_largest_output():
     tx, _tx_hash, _raw = tx_of([spend(parent_hash, 0)],
                                [TxOutput(100, THEIRS), TxOutput(800, other)])
     prevouts = {(parent_hash, 0): Prevout(OURS_HASHX, 1_000, OURS_ADDRESS)}
-    _kind, _amount, counterparty, _fee = classify_tx(coin, OURS_HASHX, tx, prevouts)
+    _kind, _amount, counterparty, _fee, _cb = classify_tx(coin, OURS_HASHX, tx, prevouts)
     assert counterparty == address(other)
 
 
@@ -159,12 +159,25 @@ def test_classify_self_send_costs_the_fee():
     tx, _tx_hash, _raw = tx_of([spend(parent_hash, 0)], [TxOutput(900, OURS)])
     prevouts = {(parent_hash, 0): Prevout(OURS_HASHX, 1_000, OURS_ADDRESS)}
     assert classify_tx(coin, OURS_HASHX, tx, prevouts) == \
-        ('send', 100, OURS_ADDRESS, 100)
+        ('send', 100, OURS_ADDRESS, 100, False)
 
 
 def test_classify_coinbase():
     tx, _tx_hash, _raw = tx_of([generation()], [TxOutput(5_000, OURS)])
-    assert classify_tx(coin, OURS_HASHX, tx, {}) == ('receive', 5_000, None, 0)
+    assert classify_tx(coin, OURS_HASHX, tx, {}) == ('receive', 5_000, None, 0, True)
+
+
+def test_classify_coinbase_has_no_counterparty():
+    '''A solo-mined block pays the miner and the dev fee; nobody sent either.'''
+    dev_fee = ScriptPubKey.P2SH_script(bytes(range(60, 80)))
+    tx, _tx_hash, _raw = tx_of([generation()],
+                               [TxOutput(59_375_000_000, OURS),
+                                TxOutput(3_125_000_000, dev_fee)])
+    kind, amount, counterparty, fee, coinbase = classify_tx(coin, OURS_HASHX, tx, {})
+    assert (kind, amount, fee) == ('receive', 59_375_000_000, 0)
+    # The dev fee output is not a sender, so there is nobody to name
+    assert counterparty is None
+    assert coinbase is True
 
 
 def test_classify_unresolved_parent_leaves_the_fee_unknown():
@@ -173,7 +186,7 @@ def test_classify_unresolved_parent_leaves_the_fee_unknown():
                                [TxOutput(1_000, OURS)])
     prevouts = {(parent_hash, 0): Prevout(hashX(THEIRS), 700, THEIRS_ADDRESS),
                 (parent_hash, 1): None}
-    kind, amount, counterparty, fee = classify_tx(coin, OURS_HASHX, tx, prevouts)
+    kind, amount, counterparty, fee, _cb = classify_tx(coin, OURS_HASHX, tx, prevouts)
     assert (kind, amount, counterparty) == ('receive', 1_000, THEIRS_ADDRESS)
     assert fee is None
 
@@ -187,7 +200,7 @@ def test_classify_ignores_asset_payloads_in_the_amount():
                                [TxOutput(0, asset_out), TxOutput(900, OURS)])
     prevouts = {(parent_hash, 0): Prevout(OURS_HASHX, 1_000, OURS_ADDRESS)}
     assert classify_tx(coin, OURS_HASHX, tx, prevouts) == \
-        ('send', 100, THEIRS_ADDRESS, 100)
+        ('send', 100, THEIRS_ADDRESS, 100, False)
 
 
 #
@@ -299,11 +312,13 @@ async def test_page_rows_are_classified(chain):
         'height': 10,
         'time': 1_700_000_010,
         'type': 'receive',
+        'coinbase': True,
         'amount': 1_000,
         'counterparty': None,
         'fee': 0,
         'confirmations': 11,
     }
+    assert spend_row['coinbase'] is False
     assert spend_row['type'] == 'send'
     # 600 paid away plus the 100 fee
     assert spend_row['amount'] == 700

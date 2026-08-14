@@ -140,12 +140,16 @@ def classify_tx(coin, hashX, tx, prevouts):
     prevouts maps an input's (prev_hash, prev_idx) to a Prevout, or to None if
     the parent transaction could not be resolved.
 
-    Returns a (kind, amount, counterparty, fee) tuple where kind is 'send' if
-    the address funded any input and 'receive' otherwise, amount is the net
-    number of satoshis the address gained or lost (a send therefore includes
-    the fee it paid, as Electrum's own history does), counterparty is the
-    largest other party of the transaction, and fee is None when an unresolved
-    parent makes it uncomputable.
+    Returns a (kind, amount, counterparty, fee, coinbase) tuple where kind is
+    'send' if the address funded any input and 'receive' otherwise, amount is
+    the net number of satoshis the address gained or lost (a send therefore
+    includes the fee it paid, as Electrum's own history does), counterparty is
+    the largest other party of the transaction, fee is None when an unresolved
+    parent makes it uncomputable, and coinbase says the coins were mined.
+
+    A coinbase has no counterparty: nobody sent the coins, they were created.
+    Callers should show it as mined rather than as a payment from an unknown
+    address.
     '''
     coinbase = any(txin.is_generation() for txin in tx.inputs)
     value_in = ours_in = 0
@@ -194,7 +198,7 @@ def classify_tx(coin, hashX, tx, prevouts):
         others = senders
     counterparty = max(others)[1] if others else None
 
-    return kind, abs(ours_out - ours_in), counterparty, fee
+    return kind, abs(ours_out - ours_in), counterparty, fee, coinbase
 
 
 def _deserialize(items):
@@ -340,7 +344,8 @@ class RichHistory:
                     out_hashX, address = script_hashX_and_address(coin, txout.pk_script)
                     prevouts[key] = Prevout(out_hashX, txout.value, address)
 
-                kind, amount, counterparty, fee = classify_tx(coin, hashX, tx, prevouts)
+                kind, amount, counterparty, fee, coinbase = classify_tx(
+                    coin, hashX, tx, prevouts)
                 if fee is None:
                     fee = mempool_fee
                 rows[(tx_hash, height)] = {
@@ -350,6 +355,7 @@ class RichHistory:
                     # saw one is the closest thing we can offer.
                     'time': times.get(height) if height > 0 else seen_at,
                     'type': kind,
+                    'coinbase': coinbase,
                     'amount': amount,
                     'counterparty': counterparty,
                     'fee': fee,

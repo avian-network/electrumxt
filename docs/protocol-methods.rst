@@ -925,6 +925,12 @@ of the output it spends.
       ``"send"`` if the script hash funded any input, ``"receive"``
       otherwise.
 
+    * *coinbase*
+
+      ``true`` if the coins were mined rather than sent by anyone.  Such a
+      row always has a *counterparty* of ``null``, and should be shown as
+      mined rather than as a payment from an unknown address.
+
     * *amount*
 
       The net number of satoshis the script hash gained or received, as a
@@ -938,7 +944,8 @@ of the output it spends.
       The largest other party of the transaction: for a send, the address
       of the biggest output not paying us; for a receive, the address of
       the biggest input not funded by us.  ``null`` when there is none -
-      a coinbase, or a script that pays to no standard address.
+      a coinbase, which nobody sent, or a transaction whose other party
+      pays to no standard address.
 
     * *fee*
 
@@ -967,6 +974,7 @@ of the output it spends.
         "height": 0,
         "time": 1723500000,
         "type": "send",
+        "coinbase": false,
         "amount": 500022600,
         "counterparty": "R9HDHYTuwAr3PyRkXrhYgwycrxC7Xja8zs",
         "fee": 22600,
