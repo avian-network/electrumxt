@@ -1,6 +1,8 @@
-cmake==3.18.4
-aiohttp==3.7.4
-pylru==1.2.0
-plyvel==1.3.0
-aiorpcx==0.22.1
-uvloop==0.16.0
+aiohttp>=3.3,<4.0
+pylru
+plyvel
+uvloop
+aiorpcx[ws]>=0.22,<0.23
+x16r_hash @ git+https://github.com/AvianNetwork/x16r_hash@b7faab42b3f1c2b113b3d119ed455de6b3037bb0
+x16rt_hash @ git+https://github.com/AvianNetwork/x16rt_hash@8a21e9e8714a803c46e75885db87efeb28b22915
+minotaurx_hash @ git+https://github.com/AvianNetwork/minotaurx_hash@19fb91bff8c9edbed73b784a61ba1f971439abf2

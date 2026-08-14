@@ -37,7 +37,7 @@ from hashlib import sha256
 
 from electrumx.lib import util
 from electrumx.lib.hash import Base58, double_sha256, hash_to_hex_str
-from electrumx.lib.hash import HASHX_LEN
+from electrumx.lib.hash import HASHX_LEN, decode_segwit_address
 from electrumx.lib.script import ScriptPubKey
 import electrumx.lib.tx as lib_tx
 from electrumx.server import daemon
@@ -293,6 +293,7 @@ class Avian(Coin):
     P2PKH_VERBYTE = bytes.fromhex("44")
     P2SH_VERBYTES = [bytes.fromhex("7A")]
     WIF_BYTE = bytes.fromhex("80")
+    SEGWIT_HRP = "avn"
     GENESIS_HASH = ('000000cdb10fc01df7fba251f2168ef7'
                     'cd7854b571049db4902c315694461dd0')
     DEFAULT_MAX_SEND = 10_000_000
@@ -307,8 +308,25 @@ class Avian(Coin):
     REORG_LIMIT = 100
     PEERS = [
         'electrum-us.avn.network s50002',
-        'electrum-eu.avn.network s50002'
+        'electrum-ca.avn.network s50002'
     ]
+
+    @classmethod
+    def pay_to_address_script(cls, address):
+        '''Return a pubkey script that pays to a coin address.
+
+        Accepts bech32 native SegWit addresses (avn1q...) as well as legacy
+        Base58Check P2PKH and P2SH addresses.
+        '''
+        witver, witprog = decode_segwit_address(cls.SEGWIT_HRP, address)
+        if witprog is not None:
+            if witver == 0 and len(witprog) == 20:
+                return ScriptPubKey.P2WPKH_script(witprog)
+            if witver == 0 and len(witprog) == 32:
+                return ScriptPubKey.P2WSH_script(witprog)
+            raise CoinError(f'invalid SegWit address: {address}')
+        # Fall back to legacy Base58Check (P2PKH / P2SH)
+        return super().pay_to_address_script(address)
 
     @classmethod
     def header_hash(cls, header):

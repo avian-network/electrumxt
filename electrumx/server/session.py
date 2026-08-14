@@ -14,6 +14,8 @@ import math
 import os
 import ssl
 import time
+import re
+from typing import Iterable, Dict, Optional, TYPE_CHECKING
 from collections import defaultdict
 from functools import partial
 from ipaddress import IPv4Address, IPv6Address
@@ -35,6 +37,11 @@ from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash, HASHX_
 
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
+
+if TYPE_CHECKING:
+    from electrumx.server.db import DB
+    from electrumx.server.mempool import MemPool
+
 
 BAD_REQUEST = 1
 DAEMON_ERROR = 2
@@ -83,6 +90,13 @@ def assert_tx_hash(value):
         pass
     raise RPCError(BAD_REQUEST, f'{value} should be a transaction hash')
 
+def assert_raw_bytes(value):
+    '''Raise an RPCError if the value is not valid raw bytes (in hex).'''
+    try:
+        return bytes.fromhex(value)
+    except (ValueError, TypeError):
+        pass
+    raise RPCError(BAD_REQUEST, f'argument should be hex-encoded bytes')
 
 @attr.s(slots=True)
 class SessionGroup:
@@ -536,7 +550,7 @@ class SessionManager:
             if n is None:
                 lines.append('No history found')
             n = None
-            utxos = await db.all_utxos(hashX)
+            utxos = await db.all_utxos(hashX, True)
             for n, utxo in enumerate(utxos, start=1):
                 lines.append(f'UTXO #{n:,d}: tx_hash '
                              f'{hash_to_hex_str(utxo.tx_hash)} '
@@ -835,7 +849,7 @@ class SessionManager:
             raise result
         return result, cost
 
-    async def _notify_sessions(self, height, touched, assets):
+    async def _notify_sessions(self, height, touched, assets, q, h, b, f, v, qv):
         '''Notify sessions about height changes and touched addresses.'''
         height_changed = height != self.notified_height
         if height_changed:
@@ -847,7 +861,7 @@ class SessionManager:
 
         async with TaskGroup() as group:
             for session in self.sessions:
-                await group.spawn(session.notify, touched, height_changed, assets)
+                await group.spawn(session.notify, touched, height_changed, assets, q, h, b, f, v, qv)
 
     def _ip_addr_group_name(self, session):
         host = session.remote_address().host
@@ -905,7 +919,7 @@ class SessionBase(RPCSession):
     session_counter = itertools.count()
     log_new = False
 
-    def __init__(self, session_mgr, db, mempool, peer_mgr, kind, transport):
+    def __init__(self, session_mgr, db: 'DB', mempool: 'MemPool', peer_mgr, kind, transport):
         connection = JSONRPCConnection(JSONRPCAutoDetect)
         super().__init__(transport, connection=connection)
         self.session_mgr = session_mgr
@@ -931,7 +945,7 @@ class SessionBase(RPCSession):
         self.recalc_concurrency()  # must be called after session_mgr.add_session
         self.request_handlers = {}
 
-    async def notify(self, touched, height_changed, assets):
+    async def notify(self, touched, height_changed, assets, q, h, b, f, v, qv):
         pass
 
     def default_framer(self):
@@ -987,7 +1001,7 @@ class SessionBase(RPCSession):
 def check_asset(name):
     if not isinstance(name, str):
         raise RPCError(
-            BAD_REQUEST, f'the asset name must be a string'
+            BAD_REQUEST, f'the asset name must be a string ({repr(name)}; {name.__class__})'
         ) from None
     if len(name) <= 0:
         raise RPCError(
@@ -1012,7 +1026,8 @@ class ElectrumX(SessionBase):
     '''A TCP server that handles incoming Electrum connections.'''
 
     PROTOCOL_MIN = (1, 4)
-    PROTOCOL_MAX = (1, 10)
+    PROTOCOL_MAX = (1, 12)
+    PROTOCOL_BAD = ((1, 9),)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1020,6 +1035,12 @@ class ElectrumX(SessionBase):
         self.connection.max_response_size = self.env.max_send
         self.hashX_subs = {}
         self.asset_subs = set()
+        self.qualifier_tag_subs = set()
+        self.h160_tag_subs = set()
+        self.broadcast_subs = set()
+        self.frozen_subs = set()
+        self.validator_subs = set()
+        self.qualifier_validator_subs = set()
         self.sv_seen = False
         self.mempool_statuses = {}
         self.set_request_handlers(self.PROTOCOL_MIN)
@@ -1047,6 +1068,7 @@ class ElectrumX(SessionBase):
             'server_version': electrumx.version,
             'protocol_min': min_str,
             'protocol_max': max_str,
+            'protocol_bad': [util.version_string(ver) for ver in cls.PROTOCOL_BAD],
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
             'services': [str(service) for service in env.report_services],
@@ -1080,7 +1102,7 @@ class ElectrumX(SessionBase):
         self.mempool_statuses.pop(hashX, None)
         return self.hashX_subs.pop(hashX, None)
 
-    async def notify(self, touched, height_changed, assets):
+    async def notify(self, touched, height_changed, assets, q, h, b, f, v, qv):
         '''Notify the client about changes to touched addresses and assets (from mempool
         updates or new blocks) and height.
         '''
@@ -1093,13 +1115,67 @@ class ElectrumX(SessionBase):
         if touched_assets:
             method = 'blockchain.asset.subscribe'
             for asset in touched_assets:
-                status_calc = self.asset_status if self.protocol_tuple >= (1, 10,) else self.asset_status_1_9
-                status = await status_calc(asset)
+                status = await self.asset_status(asset)
                 await self.send_notification(method, (asset, status))
             es = '' if len(touched_assets) == 1 else 's'
             self.logger.info(f'notified of {len(touched_assets):,d} reissued asset{es}')
 
-        touched = touched.intersection(self.hashX_subs)
+        touched_qualifier_tags = q.intersection(self.qualifier_tag_subs)
+        if touched_qualifier_tags:
+            method = 'blockchain.tag.qualifier.subscribe'
+            for qualifier in touched_qualifier_tags:
+                status = await self.tags_for_qualifier_status(qualifier)
+                await self.send_notification(method, (qualifier, status))
+            es = '' if len(touched_qualifier_tags) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_qualifier_tags):,d} qualifier tagging{es}')
+
+        touched_h160_tags = h.intersection(self.h160_tag_subs)
+        if touched_h160_tags:
+            method = 'blockchain.tag.h160.subscribe'
+            for h160 in touched_h160_tags:
+                h160_h = h160.hex()
+                status = await self.tags_for_h160_status(h160_h)
+                await self.send_notification(method, (h160_h, status))
+            es = '' if len(touched_h160_tags) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_h160_tags):,d} h160 tagging{es}')
+
+        touched_asset_broadcasts = b.intersection(self.broadcast_subs)
+        if touched_asset_broadcasts:
+            method = 'blockchain.asset.broadcasts.subscribe'
+            for asset in touched_asset_broadcasts:
+                status = await self.broadcasts_status(asset)
+                await self.send_notification(method, (asset, status))
+            es = '' if len(touched_asset_broadcasts) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_asset_broadcasts):,d} broadcast{es}')
+
+        touched_asset_freezes = f.intersection(self.frozen_subs)
+        if touched_asset_freezes:
+            method = 'blockchain.asset.is_frozen.subscribe'
+            for asset in touched_asset_freezes:
+                result = await self.is_restricted_frozen(asset)
+                await self.send_notification(method, (asset, result))
+            es = '' if len(touched_asset_freezes) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_asset_freezes):,d} freezes{es}')
+
+        touched_asset_verifier_strings = v.intersection(self.validator_subs)
+        if touched_asset_verifier_strings:
+            method = 'blockchain.asset.verifier_string.subscribe'
+            for asset in touched_asset_verifier_strings:
+                result = await self.get_restricted_string(asset)
+                await self.send_notification(method, (asset, result))
+            es = '' if len(touched_asset_verifier_strings) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_asset_verifier_strings):,d} verifier change{es}')
+
+        touched_qualifiers_that_are_in_verifiers = qv.intersection(self.qualifier_validator_subs)
+        if touched_qualifiers_that_are_in_verifiers:
+            method = 'blockchain.asset.restricted_associations.subscribe'
+            for asset in touched_qualifiers_that_are_in_verifiers:
+                status = await self.qualifier_associations_status(asset)
+                await self.send_notification(method, (f'#{asset}', status))
+            es = '' if len(touched_qualifiers_that_are_in_verifiers) == 1 else 's'
+            self.logger.info(f'notified of {len(touched_qualifiers_that_are_in_verifiers):,d} qualifier{es} in verifier strings')
+
+        touched = touched.intersection(self.hashX_subs.keys())
         if touched or (height_changed and self.mempool_statuses):
             changed = {}
 
@@ -1150,59 +1226,11 @@ class ElectrumX(SessionBase):
         return self.peer_mgr.on_peers_subscribe(self.is_tor())
 
     async def asset_status(self, asset):
-        check_asset(asset)
-        # There may only be one type at a time in the mempool
-        '''
-        Mempool struct:
-
-        'sats_in_circulation': value,
-        'divisions': divisions,
-        'reissuable': reissuable,
-        'ipfs': base_encode(asset_data, 58) if asset_data else None,
-        'has_ipfs': 1 if asset_data else 0,
-        'source': {
-            'tx_hash': hash_to_hex_str(tx_hash),
-            'tx_pos': vout_n,
-            'height': -1
-        }
-        '''
-        mempool_data = await self.session_mgr.mempool.get_asset_creation_if_any(asset)
-        if not mempool_data:
-            saved_data = await self.session_mgr.db.lookup_asset_meta(asset.encode('ascii'))
-            mempool_data = await self.session_mgr.mempool.get_asset_reissues_if_any(asset)
-            if mempool_data:
-                asset_data = {
-                    'sats_in_circulation': saved_data['sats_in_circulation'] + mempool_data['sats_in_circulation'],
-                    'divisions': mempool_data['divisions'] if mempool_data['divisions'] != 0xff else saved_data['divisions'],
-                    'has_ipfs': mempool_data['has_ipfs'] if mempool_data['has_ipfs'] else saved_data['has_ipfs'],
-                }
-                if asset_data['has_ipfs']:
-                    asset_data['ipfs'] = mempool_data.get('ipfs', None) or saved_data['ipfs']
-                asset_data['reissuable'] = mempool_data['reissuable']
-                asset_data['source'] = mempool_data['source']
-
-                if mempool_data['divisions'] == 0xff:
-                    old_source_div = saved_data.get('source_divisions', None)
-                    if old_source_div:
-                        asset_data['source_divisions'] = old_source_div
-                    else:
-                        asset_data['source_divisions'] = saved_data['source']
-
-                if not mempool_data['has_ipfs'] and saved_data['has_ipfs']:
-                    old_source_ipfs = saved_data.get('source_ipfs', None)
-                    if old_source_ipfs:
-                        asset_data['source_ipfs'] = old_source_ipfs
-                    else:
-                        asset_data['source_ipfs'] = saved_data['source']
-
-            else:
-                asset_data = saved_data
-        else:
-            asset_data = mempool_data
+        asset_data = await self.asset_get_meta(asset)
 
         if asset_data:
             # We don't need to worry about sources because a source change implies that this changes
-            self.bump_cost(0.1 + len(asset_data) * 0.00002)
+            self.bump_cost(0.1 + len(asset_data) * 0.0002)
             sats = asset_data['sats_in_circulation']
             div_amt = asset_data['divisions']
             reissuable = asset_data['reissuable']
@@ -1219,47 +1247,56 @@ class ElectrumX(SessionBase):
 
         return status
 
-
-    async def asset_status_1_9(self, asset):
-        check_asset(asset)
-        asset_data = await self.session_mgr.mempool.get_asset_creation_if_any(asset)
-        if not asset_data:
-            db_data = await self.session_mgr.db.lookup_asset_meta(asset.encode('ascii'))
-            mempool_data = await self.mempool.get_asset_reissues_if_any(asset)
-            if mempool_data:
-                asset_data = {
-                    'sats_in_circulation': db_data['sats_in_circulation'] + mempool_data['sats_in_circulation'],
-                    'divisions': mempool_data['divisions'] if mempool_data['divisions'] != 0xff else db_data['divisions'],
-                    'has_ipfs': mempool_data['has_ipfs'] if mempool_data['has_ipfs'] != 0 else db_data['has_ipfs'],
-                }
-                if mempool_data['has_ipfs'] != 0 or db_data['has_ipfs'] != 0:
-                    asset_data['ipfs'] = mempool_data['ipfs'] if mempool_data.get('ipfs', None) else db_data['ipfs']
-                asset_data['reissuable'] = mempool_data['reissuable']
-                asset_data['source'] = mempool_data['source']
-                
-                if mempool_data['divisions'] == 0xff:
-                    asset_data['source_divisions'] = db_data['source_divisions'] if 'source_divisions' in db_data else db_data['source']
-            else:
-                asset_data = db_data
-
-
-        ptuple = self.protocol_tuple
-        if asset_data:
-            self.bump_cost(0.1 + len(asset_data) * 0.00002)
-            sats = str(asset_data['sats_in_circulation']) if ptuple >= (1, 9) else ''
-            div_amt = asset_data['divisions']
-            reissuable = False if asset_data['reissuable'] == 0 else True
-            has_ipfs = False if asset_data['has_ipfs'] == 0 else True
-
-            h = ''.join([sats, str(div_amt), str(reissuable), str(has_ipfs)])
-            if has_ipfs:
-                h += asset_data['ipfs']
-
-            status = sha256(h.encode('ascii')).hex()
+    async def tags_for_qualifier_status(self, qualifier: str):
+        if qualifier[0] != '#' and qualifier[0] != '$':
+            raise RPCError(
+                BAD_REQUEST, f'{qualifier} is not a qualifier nor a restricted asset'
+            ) from None
+        data = await self.qualifications_for_qualifier(qualifier)
+        s_data = sorted(data.items(), key=lambda x: x[0])
+        if s_data:
+            status = ';'.join(f'{h160}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for h160, d in s_data)
+            self.bump_cost(0.1 + len(status) * 0.00002)
+            status = sha256(status.encode()).hex()
         else:
             self.bump_cost(0.1)
             status = None
+        return status
+    
+    async def tags_for_h160_status(self, h160):
+        data = await self.qualifications_for_h160(h160)
+        s_data = sorted(data.items(), key=lambda x: x[0])
+        if s_data:
+            status = ';'.join(f'{asset}:{d["height"]}{d["tx_hash"]}{d["tx_pos"]}{d["flag"]}' for asset, d in s_data)
+            self.bump_cost(0.1 + len(status) * 0.00002)
+            status = sha256(status.encode()).hex()
+        else:
+            self.bump_cost(0.1)
+            status = None
+        return status
 
+    async def broadcasts_status(self, asset):
+        data = await self.get_messages(asset)
+        s_data = sorted(data, key=lambda x: (x["height"], x['tx_hash'], x["tx_pos"]))
+        if s_data:
+            status = ';'.join(f'{d["tx_hash"]}:{d["height"]}{d["tx_pos"]}{d["data"]}{d["expiration"]}' for d in s_data)
+            self.bump_cost(0.1 + len(status) * 0.00002)
+            status = sha256(status.encode()).hex()
+        else:
+            self.bump_cost(0.1)
+            status = None
+        return status
+    
+    async def qualifier_associations_status(self, asset):
+        data = await self.lookup_qualifier_associations(asset)
+        s_data = sorted(data.items(), key=lambda x: x[0])
+        if s_data:
+            status = ';'.join(f'{asset}:{d["height"]}{d["tx_hash"]}{d["restricted_tx_pos"]}{d["qualifying_tx_pos"]}{d["associated"]}' for asset, d in s_data)
+            self.bump_cost(0.1 + len(status) * 0.00002)
+            status = sha256(status.encode()).hex()
+        else:
+            self.bump_cost(0.1)
+            status = None
         return status
 
     async def address_status(self, hashX):
@@ -1303,33 +1340,31 @@ class ElectrumX(SessionBase):
             self.unsubscribe_hashX(hashX)
             return None
 
-    async def hashX_listassets(self, hashX):
-        assets = await self.db.all_assets(hashX)
-        assets = sorted(assets)
-        assets.extend(await self.mempool.unordered_ASSETs(hashX))
-        self.bump_cost(1.0 + len(assets) / 50)
-        spends = await self.mempool.potential_spends(hashX)
-
-        return [{'tx_hash': hash_to_hex_str(asset.tx_hash),
-                 'tx_pos': asset.tx_pos,
-                 'height': asset.height,
-                 'name': asset.name,
-                 'value': asset.value}
-                for asset in assets
-                if (asset.tx_hash, asset.tx_pos) not in spends]
-
-    async def hashX_listunspent(self, hashX):
+    async def hashX_listunspent(self, hashX, asset):
         '''Return the list of UTXOs of a script hash, including mempool
         effects.'''
-        utxos = await self.db.all_utxos(hashX)
+        if asset is None:
+            asset = False
+        if isinstance(asset, str):
+            check_asset(asset)
+        elif isinstance(asset, Iterable):
+            for a in asset:
+                if a is None: continue
+                check_asset(a)
+        elif not isinstance(asset, bool):
+            raise RPCError(
+                BAD_REQUEST, f'asset must be a list, string, or boolean'
+            ) from None
+
+        utxos = await self.db.all_utxos(hashX, asset)
         utxos = sorted(utxos)
-        utxos.extend(await self.mempool.unordered_UTXOs(hashX))
+        utxos.extend(await self.mempool.unordered_UTXOs(hashX, asset))
         self.bump_cost(1.0 + len(utxos) / 50)
         spends = await self.mempool.potential_spends(hashX)
 
         return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
                  'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
+                 'height': utxo.height, 'asset': utxo.name, 'value': utxo.value}
                 for utxo in utxos
                 if (utxo.tx_hash, utxo.tx_pos) not in spends]
 
@@ -1340,51 +1375,118 @@ class ElectrumX(SessionBase):
         return result
 
     async def asset_subscribe(self, asset):
-        if len(asset) > 31:
-            raise RPCError(
-                BAD_REQUEST, f'asset name greater than 31 characters'
-            ) from None
-        status_calc = self.asset_status if self.protocol_tuple >= (1, 10,) else self.asset_status_1_9
-        result = await status_calc(asset)
+        check_asset(asset)
+        result = await self.asset_status(asset)
         self.asset_subs.add(asset)
         return result
 
     async def asset_unsubscribe(self, asset):
-        if len(asset) > 31:
-            raise RPCError(
-                BAD_REQUEST, f'asset name greater than 31 characters'
-            ) from None
+        check_asset(asset)
         return self.asset_subs.discard(asset) is not None
 
-    async def get_balance(self, hashX):
-        utxos = await self.db.all_utxos(hashX)
-        confirmed = sum(utxo.value for utxo in utxos)
-        unconfirmed = await self.mempool.balance_delta(hashX)
+    async def subscribe_qualifier_tagging(self, qualifier):
+        check_asset(qualifier)
+        result = await self.tags_for_qualifier_status(qualifier)
+        self.qualifier_tag_subs.add(qualifier)
+        return result
+
+    async def unsubscribe_qualifier_tagging(self, qualifier):
+        check_asset(qualifier)
+        return self.qualifier_tag_subs.discard(qualifier) is not None
+
+    async def subscribe_h160_tagged(self, h160):
+        check_h160(h160)
+        h160_b = bytes.fromhex(h160)
+        result = await self.tags_for_h160_status(h160)
+        self.h160_tag_subs.add(h160_b)
+        return result
+
+    async def unsubscribe_h160_tagged(self, h160):
+        check_h160(h160)
+        h160_b = bytes.fromhex(h160)
+        return self.h160_tag_subs.discard(h160_b) is not None
+
+    async def subscribe_broadcast(self, asset):
+        check_asset(asset)
+        result = await self.broadcasts_status(asset)
+        self.broadcast_subs.add(asset)
+        return result
+    
+    async def unsubscribe_broadcast(self, asset):
+        check_asset(asset)
+        return self.broadcast_subs.discard(asset) is not None
+
+    async def subscribe_asset_freeze(self, asset):
+        check_asset(asset)
+        result = await self.is_restricted_frozen(asset)
+        self.frozen_subs.add(asset)
+        return result
+
+    async def unsubscribe_asset_freeze(self, asset):
+        check_asset(asset)
+        return self.frozen_subs.discard(asset) is not None
+
+    async def subscribe_restricted_verification_change(self, asset):
+        check_asset(asset)
+        result = await self.get_restricted_string(asset)
+        self.validator_subs.add(asset)
+        return result
+    
+    async def unsubscribe_restricted_verification_change(self, asset):
+        check_asset(asset)
+        return self.validator_subs.discard(asset) is not None
+
+    async def subscribe_qualifier_associated_restricted(self, asset):
+        check_asset(asset)
+        if asset[0] != '#':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a qualifier'
+            ) from None
+        result = await self.qualifier_associations_status(asset)
+        self.qualifier_validator_subs.add(asset)
+        return result
+
+    async def unsubscribe_qualifier_associated_restricted(self, asset):
+        check_asset(asset)
+        if asset[0] != '#':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a qualifier'
+            ) from None
+        return self.qualifier_validator_subs.discard(asset) is not None
+
+    async def get_balance(self, hashX, asset):
+        must_have_names = []
+        if isinstance(asset, str):
+            check_asset(asset)
+            must_have_names = [asset]
+        elif isinstance(asset, Iterable):
+            for a in asset:
+                if a is None: continue
+                check_asset(a)
+            must_have_names = asset
+        elif not isinstance(asset, bool):
+            raise RPCError(
+                BAD_REQUEST, f'asset must be a list, string, or boolean'
+            ) from None
+        utxos = await self.db.all_utxos(hashX, asset)
+        confirmed = defaultdict(int)
+        for utxo in utxos:
+            confirmed[utxo.name] += utxo.value
+        unconfirmed: Dict[Optional[str], int] = await self.mempool.balance_delta(hashX, asset)
         self.bump_cost(1.0 + len(utxos) / 50)
-        return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
+        include_names = asset is True or (asset is not False and not isinstance(asset, str))
+        if include_names:
+            return {(k or 'rvn'): {'confirmed': confirmed[k], 'unconfirmed': unconfirmed[k]} for k in set(confirmed.keys()).union(unconfirmed.keys()).union(must_have_names)}
+        else:
+            confirmed = 0 if len(confirmed) == 0 else confirmed[list(confirmed.keys())[0]]
+            unconfirmed = 0 if len(unconfirmed) == 0 else unconfirmed[list(unconfirmed.keys())[0]]
+            return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
-    async def get_asset_balance(self, hashX):
-        assets = await self.db.all_assets(hashX)
-        confirmed = {}
-        for asset in assets:
-            if asset.name not in confirmed:
-                confirmed[asset.name] = asset.value
-            else:
-                confirmed[asset.name] += asset.value
-        unconfirmed = await self.mempool.asset_balance_delta(hashX)
-        self.bump_cost(1.0 + len(assets) / 50)
-        return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
-
-
-    async def scripthash_get_balance(self, scripthash):
+    async def scripthash_get_balance(self, scripthash, asset=False):
         '''Return the confirmed and unconfirmed balance of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
-        return await self.get_balance(hashX)
-
-    async def scripthash_get_asset_balance(self, scripthash):
-        hashX = scripthash_to_hashX(scripthash)
-        return await self.get_asset_balance(hashX)
-
+        return await self.get_balance(hashX, asset)
+    
     async def unconfirmed_history(self, hashX):
         # Note unconfirmed history is unordered in electrum-server
         # height is -1 if it has unconfirmed inputs, otherwise 0
@@ -1413,14 +1515,10 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         return await self.unconfirmed_history(hashX)
 
-    async def scripthash_listunspent(self, scripthash):
+    async def scripthash_listunspent(self, scripthash, asset=False):
         '''Return the list of UTXOs of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
-        return await self.hashX_listunspent(hashX)
-
-    async def scripthash_listassets(self, scripthash):
-        hashX = scripthash_to_hashX(scripthash)
-        return await self.hashX_listassets(hashX)
+        return await self.hashX_listunspent(hashX, asset)
 
     async def scripthash_subscribe(self, scripthash):
         '''Subscribe to a script hash.
@@ -1621,6 +1719,10 @@ class ElectrumX(SessionBase):
         ptuple, client_min = util.protocol_version(
             protocol_version, self.PROTOCOL_MIN, self.PROTOCOL_MAX)
 
+        if ptuple in self.PROTOCOL_BAD:
+            raise ReplyAndDisconnect(RPCError(
+                BAD_REQUEST, f'unsupported protocol version: {protocol_version}'))
+
         if ptuple is None:
             if client_min > self.PROTOCOL_MIN:
                 self.logger.info(f'client requested future protocol version '
@@ -1636,6 +1738,7 @@ class ElectrumX(SessionBase):
         '''Broadcast a raw transaction to the network.
 
         raw_tx: the raw transaction as a hexadecimal string'''
+        assert_raw_bytes(raw_tx)
         self.bump_cost(0.25 + len(raw_tx) / 5000)
         # This returns errors as JSON RPC errors, as is natural
         try:
@@ -1750,16 +1853,34 @@ class ElectrumX(SessionBase):
             self.bump_cost(cost)
             return hash_to_hex_str(tx_hash)
 
-    async def asset_get_meta(self, name: str):
+    async def asset_get_meta_history(self, name: str, include_mempool=True):
         check_asset(name)
+        ret = await self.db.lookup_asset_meta_history(name.encode())
+        self.bump_cost(1.0 + len(ret) / 30)
+        if include_mempool:
+            mempool_data = await self.mempool.get_asset_reissues_if_any(name) or await self.mempool.get_asset_creation_if_any(name)
+            if mempool_data:
+                return ret + [{
+                    'sats': mempool_data['sats_in_circulation'],
+                    'divisions': mempool_data['divisions'],
+                    'has_ipfs': mempool_data['has_ipfs'],
+                    'ipfs': mempool_data.get('ipfs', None),
+                    'tx_hash': mempool_data['source']['tx_hash'],
+                    'tx_pos': mempool_data['source']['tx_pos'],
+                    'height': mempool_data['source']['height']
+                }]
+        return ret
+
+    async def asset_get_meta(self, name: str, include_mempool=True):
         self.bump_cost(1.0)
-        mempool_data = await self.session_mgr.mempool.get_asset_creation_if_any(name)
-        if mempool_data:
+        check_asset(name)
+        mempool_data = await self.mempool.get_asset_creation_if_any(name)
+        if mempool_data and include_mempool:
             return mempool_data
         else:
-            saved_data = await self.session_mgr.db.lookup_asset_meta(name.encode('ascii'))
-            mempool_data = await self.session_mgr.mempool.get_asset_reissues_if_any(name)
-            if mempool_data:
+            saved_data = await self.db.lookup_asset_meta(name.encode('ascii'))
+            mempool_data = await self.mempool.get_asset_reissues_if_any(name)
+            if mempool_data and include_mempool:
                 asset_data = {
                     'sats_in_circulation': saved_data['sats_in_circulation'] + mempool_data['sats_in_circulation'],
                     'divisions': mempool_data['divisions'] if mempool_data['divisions'] != 0xff else saved_data['divisions'],
@@ -1789,50 +1910,20 @@ class ElectrumX(SessionBase):
         
             return asset_data
 
-    async def asset_get_meta_1_9(self, name: str):
-        check_asset(name)
-        self.bump_cost(1.0)
-        mempool_data = await self.mempool.get_asset_creation_if_any(name)
-        if mempool_data:
-            return mempool_data
-
-        db_data = await self.db.lookup_asset_meta(name.encode('ascii'))
-        mempool_data = await self.mempool.get_asset_reissues_if_any(name)
-        if mempool_data:
-            to_ret = {
-                'sats_in_circulation': db_data['sats_in_circulation'] + mempool_data['sats_in_circulation'],
-                'divisions': mempool_data['divisions'] if mempool_data['divisions'] != 0xff else db_data['divisions'],
-                'has_ipfs': 1 if (mempool_data['has_ipfs'] if mempool_data['has_ipfs'] != 0 else db_data['has_ipfs']) else 0,
-            }
-            if mempool_data['has_ipfs'] != 0 or db_data['has_ipfs'] != 0:
-                to_ret['ipfs'] = mempool_data['ipfs'] if mempool_data['ipfs'] else db_data['ipfs']
-            to_ret['reissuable'] = 1 if mempool_data['reissuable'] else 0
-            to_ret['source'] = mempool_data['source']
-            
-            if mempool_data['divisions'] == 0xff:
-                to_ret['source_prev'] = db_data['source_divisions'] if 'source_divisions' in db_data else db_data['source']
-            return to_ret
-        else:
-            db_data.pop('source_ipfs', None)
-            source_div = db_data.pop('source_divisions', None)
-            if source_div:
-                db_data['source_prev'] = source_div
-            db_data['has_ipfs'] = 1 if db_data['has_ipfs'] else 0
-            db_data['reissuable'] = 1 if db_data['reissuable'] else 0
-            return db_data
-
+    
     async def get_assets_with_prefix(self, prefix: str):
         check_asset(prefix)
-        prefix = prefix.upper()
         ret = await self.db.get_assets_with_prefix(prefix.encode('ascii'))
         self.bump_cost(1.0 + len(ret) / 10)
         return ret
 
     async def get_messages(self, name):
         check_asset(name)
-        ret = await self.db.lookup_messages(name.encode('ascii'))
-        self.bump_cost(1.0 + len(ret) / 10)
-        return ret
+        b_items = await self.db.lookup_messages(name.encode('ascii'))
+        self.bump_cost(1.0 + len(b_items) / 10)
+        m_items = await self.mempool.get_broadcasts(name.encode('ascii'))
+        b_items.sort(key=lambda x: (x['height'], x['tx_hash']), reverse=True)
+        return m_items + b_items
 
     async def is_qualified(self, h160: str, asset: str):
         check_asset(asset)
@@ -1840,28 +1931,165 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0)
         return await self.db.is_h160_qualified(bytes.fromhex(h160), asset.encode('ascii'))
 
-    async def qualifications_for_h160(self, h160: str):
+    async def qualifications_for_h160_history(self, h160: str, include_mempool=True):
+        check_h160(h160)
+        res = await self.db.qualifications_for_h160_history(bytes.fromhex(h160))
+        self.bump_cost(2.0 + len(res) / 30)
+        if include_mempool:
+            mem_res = await self.mempool.get_h160_tags(h160)
+            if mem_res:
+                return res + [{
+                    'asset': asset,
+                    'flag': d['flag'],
+                    'tx_hash': d['tx_hash'],
+                    'tx_pos': d['tx_pos'],
+                    'height': d['height'],
+                } for asset, d in mem_res.items()]
+        return res
+
+    async def qualifications_for_h160(self, h160: str, include_mempool=True):
         check_h160(h160)
         res = await self.db.qualifications_for_h160(bytes.fromhex(h160))
         self.bump_cost(1.0 + len(res) / 10)
+        if include_mempool:
+            mem_res = await self.mempool.get_h160_tags(h160)
+            for asset, d in mem_res.items():
+                res[asset] = d
         return res
 
-    async def is_restricted_frozen(self, asset: str):
+    async def qualifications_for_qualifier_history(self, asset: str, include_mempool=True):
         check_asset(asset)
+        res = await self.db.qualifications_for_qualifier_history(asset.encode())
+        self.bump_cost(2.0 + len(res) / 30)
+        if include_mempool:
+            mem_res = await self.mempool.get_qualifier_tags(asset)
+            if mem_res:
+                return res + [{
+                    'h160': h160_h,
+                    'flag': d['flag'],
+                    'tx_hash': d['tx_hash'],
+                    'tx_pos': d['tx_pos'],
+                    'height': d['height'],
+                } for h160_h, d in mem_res.items()]
+        return res
+
+    async def qualifications_for_qualifier(self, asset: str, include_mempool=True):
+        check_asset(asset)
+        res = await self.db.qualifications_for_qualifier(asset.encode())
+        # This incurs 2 db lookups and is no longer contiguous
+        self.bump_cost(2.0 + len(res))
+        if include_mempool:
+            mem_res = await self.mempool.get_qualifier_tags(asset)
+            for h160_h, d in mem_res.items():
+                res[h160_h] = d
+        return res
+
+    async def restricted_frozen_history(self, asset: str, include_mempool=True):
+        check_asset(asset)
+        if asset[0] != '$':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a restricted asset'
+            ) from None
+        res = await self.db.restricted_frozen_history(asset.encode())
+        self.bump_cost(2.0 + len(res) / 30)
+        if include_mempool:
+            mem_res = await self.mempool.is_frozen(asset)
+            if mem_res:
+                return res + [mem_res]
+        return res
+
+    async def is_restricted_frozen(self, asset: str, include_mempool=True):
+        check_asset(asset)
+        if asset[0] != '$':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a restricted asset'
+            ) from None
+        if include_mempool:
+            mem_res = await self.mempool.is_frozen(asset)
+            if mem_res:
+                return mem_res
         self.bump_cost(1.0)
         return await self.db.is_restricted_frozen(asset.encode('ascii'))
 
-    async def get_restricted_string(self, asset: str):
+    async def get_restricted_string_history(self, asset: str, include_mempool=True):
         check_asset(asset)
+        if asset[0] != '$':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a restricted asset'
+            ) from None
+        res = await self.db.get_restricted_string_history(asset.encode())
+        self.bump_cost(1.0 + len(res) / 30)
+        if include_mempool:
+            mem_res = await self.mempool.restricted_verifier(asset)
+            if mem_res:
+                return res + [{
+                    'string': mem_res['string'],
+                    'tx_hash': mem_res['tx_hash'],
+                    'restricted_tx_pos': mem_res['restricted_tx_pos'],
+                    'qualifying_tx_pos': mem_res['qualifying_tx_pos'],
+                    'height': mem_res['height']
+                }]
+        return res
+
+    async def get_restricted_string(self, asset: str, include_mempool=True):
+        check_asset(asset)
+        if asset[0] != '$':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a restricted asset'
+            ) from None
+        if include_mempool:
+            mem_res = await self.mempool.restricted_verifier(asset)
+            if mem_res:
+                return mem_res
         self.bump_cost(1.0)
         return await self.db.get_restricted_string(asset.encode('ascii'))
 
-    async def lookup_qualifier_associations(self, asset: str):
+    async def lookup_qualifier_associations_history(self, asset: str, include_mempool=True):
         check_asset(asset)
-        if asset[0] == '#':
-            asset = asset[1:]
-        res = await self.db.lookup_qualifier_associations(asset.encode('ascii'))
+        if asset[0] != '#':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a qualifier'
+            ) from None
+        first_chunk = asset.split('/')[0]
+        res = await self.db.lookup_qualifier_associations_history(first_chunk.encode())
+        self.bump_cost(1.0 + len(res) / 30)
+        if include_mempool:
+            res_d = await self.lookup_qualifier_associations(asset)
+            if res_d:
+                return res + [{         
+                    'asset': asset,
+                    'associated': mem_d['associated'],
+                    'tx_hash': mem_d['tx_hash'],
+                    'restricted_tx_pos': mem_d['restricted_tx_pos'],
+                    'qualifying_tx_pos': mem_d['qualifying_tx_pos'],
+                    'height': mem_d['height'],
+                } for asset, mem_d in res_d.items() if mem_d['height'] < 0]
+        return res
+
+    async def lookup_qualifier_associations(self, asset: str, include_mempool=True):
+        check_asset(asset)
+        if asset[0] != '#':
+            raise RPCError(
+                BAD_REQUEST, f'{asset} is not a qualifier'
+            ) from None
+        first_chunk = asset.split('/')[0]
+        res = await self.db.lookup_qualifier_associations(first_chunk.encode())
         self.bump_cost(1.0 + len(res) / 10)
+        if include_mempool:
+            for res_asset in list(res.keys()):
+                res_d = await self.mempool.restricted_verifier(res_asset)
+                if not res_d: continue
+                if asset not in re.findall(r'([A-Z0-9_.]+)', res_d['string']):
+                    res[res_asset] = {
+                        'associated': False,
+                        'height': -1,
+                        'tx_hash': res_d['tx_hash'],
+                        'restricted_tx_pos': res_d['restricted_tx_pos'],
+                        'qualifying_tx_pos': res_d['qualifying_tx_pos']
+                    }
+            mem_res = await self.mempool.restricted_assets_associated_with_qualifier(asset)
+            for res_asset, d in mem_res.items():
+                res[res_asset] = d
         return res
 
     async def compact_fee_histogram(self):
@@ -1910,37 +2138,47 @@ class ElectrumX(SessionBase):
             'server.peers.subscribe': self.peers_subscribe,
             'server.ping': self.ping,
             'server.version': self.server_version,
+            'blockchain.scripthash.unsubscribe': self.scripthash_unsubscribe,
+            'blockchain.asset.subscribe': self.asset_subscribe,
+            'blockchain.asset.unsubscribe': self.asset_unsubscribe,
+            'blockchain.asset.check_tag': self.is_qualified,
+            'blockchain.asset.all_tags': self.qualifications_for_h160,
+            'blockchain.asset.is_frozen': self.is_restricted_frozen,
+            'blockchain.asset.validator_string': self.get_restricted_string,
+            'blockchain.asset.restricted_associations': self.lookup_qualifier_associations,
+            'blockchain.asset.broadcasts': self.get_messages,
+            'blockchain.asset.get_assets_with_prefix': self.get_assets_with_prefix,
+            'blockchain.asset.list_addresses_by_asset': self.list_addresses_by_asset,
+            'blockchain.asset.get_meta': self.asset_get_meta,
+
+            # 1.11
+            'blockchain.asset.verifier_string': self.get_restricted_string,
+            'blockchain.tag.check': self.is_qualified,
+            'blockchain.tag.qualifier.list': self.qualifications_for_qualifier,
+            'blockchain.tag.h160.list': self.qualifications_for_h160,
+            'blockchain.tag.qualifier.subscribe': self.subscribe_qualifier_tagging,
+            'blockchain.tag.qualifier.unsubscribe': self.unsubscribe_qualifier_tagging,
+            'blockchain.tag.h160.subscribe': self.subscribe_h160_tagged,
+            'blockchain.tag.h160.unsubscribe': self.unsubscribe_h160_tagged,
+            'blockchain.asset.broadcasts.subscribe': self.subscribe_broadcast,
+            'blockchain.asset.broadcasts.unsubscribe': self.unsubscribe_broadcast,
+            'blockchain.asset.is_frozen.subscribe': self.subscribe_asset_freeze,
+            'blockchain.asset.is_frozen.unsubscribe': self.unsubscribe_asset_freeze,
+            'blockchain.asset.verifier_string.subscribe': self.subscribe_restricted_verification_change,
+            'blockchain.asset.verifier_string.unsubscribe': self.unsubscribe_restricted_verification_change,
+            'blockchain.asset.restricted_associations.subscribe': self.subscribe_qualifier_associated_restricted,
+            'blockchain.asset.restricted_associations.unsubscribe': self.unsubscribe_qualifier_associated_restricted,
+
+            #1.12
+            'blockchain.asset.get_meta_history': self.asset_get_meta_history,
+            'blockchain.asset.verifier_string_history': self.get_restricted_string_history,
+            'blockchain.tag.qualifier.history': self.qualifications_for_qualifier_history,
+            'blockchain.tag.h160.history': self.qualifications_for_h160_history,
+            'blockchain.asset.frozen_history': self.restricted_frozen_history,
+            'blockchain.asset.restricted_associations_history': self.lookup_qualifier_associations_history,
         }
 
-        # TESTING
-        handlers['server.our_stats'] = self.get_session_stats
-        # END TESTING
-
-        if ptuple >= (1, 4, 2):
-            handlers['blockchain.scripthash.unsubscribe'] = self.scripthash_unsubscribe
-
-        if ptuple >= (1, 8):
-            handlers['blockchain.scripthash.get_asset_balance'] = self.scripthash_get_asset_balance
-            handlers['blockchain.scripthash.listassets'] = self.scripthash_listassets
-            handlers['blockchain.asset.get_meta'] = self.asset_get_meta_1_9
-            handlers['blockchain.asset.subscribe'] = self.asset_subscribe
-            handlers['blockchain.asset.unsubscribe'] = self.asset_unsubscribe
-
-        if ptuple >= (1, 9):
-            handlers['blockchain.asset.check_tag'] = self.is_qualified
-            handlers['blockchain.asset.all_tags'] = self.qualifications_for_h160
-            handlers['blockchain.asset.is_frozen'] = self.is_restricted_frozen
-            handlers['blockchain.asset.validator_string'] = self.get_restricted_string
-            handlers['blockchain.asset.restricted_associations'] = self.lookup_qualifier_associations
-            handlers['blockchain.asset.broadcasts'] = self.get_messages
-            handlers['blockchain.asset.get_assets_with_prefix'] = self.get_assets_with_prefix
-            handlers['blockchain.asset.list_addresses_by_asset'] = self.list_addresses_by_asset
-
-        if ptuple >= (1, 10):
-            handlers['blockchain.asset.get_meta'] = self.asset_get_meta
-
         self.request_handlers = handlers
-
 
 class LocalRPC(SessionBase):
     '''A local TCP RPC server session.'''

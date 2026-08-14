@@ -17,3 +17,7 @@ docs/_build
 test_get_ops.py
 test_address.py
 test_advance.py
+
+# Local server config - these hold daemon RPC credentials
+electrumx.conf
+run-electrumx.env

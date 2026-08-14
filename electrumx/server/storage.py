@@ -9,11 +9,12 @@
 
 import os
 from functools import partial
+from typing import Callable
 
 from electrumx.lib import util
 
 
-def db_class(name):
+def db_class(name) -> Callable[[str, bool], 'Storage']:
     '''Returns a DB engine class.'''
     for db_class_ in util.subclasses(Storage):
         if db_class_.__name__.lower() == name.lower():

@@ -235,6 +235,18 @@ class ScriptPubKey(object):
                 + Script.push_data(hash160)
                 + bytes([OpCodes.OP_EQUALVERIFY, OpCodes.OP_CHECKSIG]))
 
+    @classmethod
+    def P2WPKH_script(cls, hash160):
+        '''SegWit v0 P2WPKH: OP_0 <20-byte-hash>'''
+        assert len(hash160) == 20
+        return bytes([OpCodes.OP_0, 0x14]) + hash160
+
+    @classmethod
+    def P2WSH_script(cls, hash256):
+        '''SegWit v0 P2WSH: OP_0 <32-byte-hash>'''
+        assert len(hash256) == 32
+        return bytes([OpCodes.OP_0, 0x20]) + hash256
+
 
 class Script(object):
 

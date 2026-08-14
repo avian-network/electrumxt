@@ -404,7 +404,7 @@ class DataParser:
                 return 'ParserException raised'
 
     def __init__(self, data: bytes):
-        self.data = bytes(data) if data else data
+        self.data = bytes(data) if data else b''
         self.cursor = 0
         self.length = len(data) if data else 0
 
@@ -464,3 +464,72 @@ class DataParser:
             return True
         else:
             return self.cursor >= self.length - 1
+
+
+# We monkey-patch aiorpcx.TaskGroup._add_task.
+# This is to plug a memory-leak, see https://github.com/kyuupichan/aiorpcX/issues/46 .
+# Note: this breaks the TaskGroup.results and TaskGroup.exceptions APIs
+#       but we are not using them anyway.
+# TODO: this monkey-patch can be removed once we require aiorpcx versions that
+#       have the upstream fix for #46.
+def _patched_TaskGroup_add_task(self: 'aiorpcx.TaskGroup', task):
+    self._orig_add_task(self, task)
+    if not hasattr(self, "_retain"):
+        self.tasks.clear()
+
+
+aiorpcx.TaskGroup._orig_add_task = staticmethod(aiorpcx.TaskGroup._add_task)
+aiorpcx.TaskGroup._add_task = _patched_TaskGroup_add_task
+
+
+# We monkey-patch aiorpcx TimeoutAfter (used by timeout_after and ignore_after API),
+# to fix a timing issue present in asyncio as a whole re timing out tasks.
+# To see the issue we are trying to fix, consider example:
+#     async def outer_task():
+#         async with timeout_after(0.1):
+#             await inner_task()
+# When the 0.1 sec timeout expires, inner_task will get cancelled by timeout_after
+# (=internal cancellation).
+# If around the same time (in terms of event loop iterations) another coroutine
+# cancels outer_task (=external cancellation), there will be a race.
+# Both cancellations work by propagating a CancelledError out to timeout_after, which then
+# needs to decide (in TimeoutAfter.__aexit__) whether it's due to an internal or external cancel.
+# AFAICT asyncio provides no reliable way of distinguishing between the two.
+# This patch tries to always give priority to external cancellations.
+# see https://github.com/kyuupichan/aiorpcX/issues/44
+# see https://github.com/aio-libs/async-timeout/issues/229
+# see https://bugs.python.org/issue42130 and https://bugs.python.org/issue45098
+def _aiorpcx_monkeypatched_set_new_deadline(task, deadline):
+    def timeout_task():
+        task._orig_cancel()
+        task._timed_out = None if getattr(task, "_externally_cancelled", False) else deadline
+
+    def mycancel(*args, **kwargs):
+        task._orig_cancel(*args, **kwargs)
+        task._externally_cancelled = True
+        task._timed_out = None
+    if not hasattr(task, "_orig_cancel"):
+        task._orig_cancel = task.cancel
+        task.cancel = mycancel
+    task._deadline_handle = task._loop.call_at(deadline, timeout_task)
+
+
+def _aiorpcx_monkeypatched_set_task_deadline(task, deadline):
+    ret = _aiorpcx_orig_set_task_deadline(task, deadline)
+    task._externally_cancelled = None
+    return ret
+
+
+def _aiorpcx_monkeypatched_unset_task_deadline(task):
+    if hasattr(task, "_orig_cancel"):
+        task.cancel = task._orig_cancel
+        del task._orig_cancel
+    return _aiorpcx_orig_unset_task_deadline(task)
+
+
+_aiorpcx_orig_set_task_deadline = aiorpcx.curio._set_task_deadline
+_aiorpcx_orig_unset_task_deadline = aiorpcx.curio._unset_task_deadline
+
+aiorpcx.curio._set_new_deadline = _aiorpcx_monkeypatched_set_new_deadline
+aiorpcx.curio._set_task_deadline = _aiorpcx_monkeypatched_set_task_deadline
+aiorpcx.curio._unset_task_deadline = _aiorpcx_monkeypatched_unset_task_deadline

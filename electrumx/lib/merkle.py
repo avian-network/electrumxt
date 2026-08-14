@@ -28,7 +28,7 @@
 
 from math import ceil, log
 
-from aiorpcx import Event
+from aiorpcx import Event, run_in_thread
 
 from electrumx.lib.hash import double_sha256
 
@@ -221,7 +221,8 @@ class MerkleCache(object):
         '''Call to initialize the cache to a source of given length.'''
         self.length = length
         self.depth_higher = self.merkle.tree_depth(length) // 2
-        self.level = self._level(await self.source_func(0, length))
+        hashes = await self.source_func(0, length)
+        self.level = await run_in_thread(self._level, hashes)
         self.initialized.set()
 
     def truncate(self, length):

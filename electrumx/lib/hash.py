@@ -144,3 +144,125 @@ class Base58(object):
         into a Base58Check string."""
         be_bytes = payload + hash_fn(payload)[:4]
         return Base58.encode(be_bytes)
+
+
+# ---------------------------------------------------------------------------
+# BIP-0173 bech32 implementation (SegWit v0)
+# Reference: https://github.com/bitcoin/bips/blob/master/bip-0173.mediawiki
+# ---------------------------------------------------------------------------
+
+_BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
+_BECH32_CHAR_MAP = {c: i for i, c in enumerate(_BECH32_CHARSET)}
+
+
+def _bech32_polymod(values):
+    '''Internal function that computes the Bech32 checksum.'''
+    generator = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = (chk & 0x1ffffff) << 5 ^ value
+        for i in range(5):
+            chk ^= generator[i] if ((top >> i) & 1) else 0
+    return chk
+
+
+def _bech32_hrp_expand(hrp):
+    '''Expand the HRP into values for checksum computation.'''
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+
+def _bech32_verify_checksum(hrp, data):
+    return _bech32_polymod(_bech32_hrp_expand(hrp) + list(data)) == 1
+
+
+def _bech32_create_checksum(hrp, data):
+    values = _bech32_hrp_expand(hrp) + list(data)
+    polymod = _bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+
+def _convertbits(data, frombits, tobits, pad=True):
+    '''General power-of-2 base conversion.  Returns None on failure.'''
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+
+def bech32_decode(bech):
+    '''Decode a bech32 string.
+
+    Returns (hrp, data_5bit) on success where data_5bit is a list of 5-bit
+    values (excluding checksum).  Returns (None, None) on failure.
+    '''
+    if any(ord(x) < 33 or ord(x) > 126 for x in bech):
+        return None, None
+    if bech.lower() != bech and bech.upper() != bech:
+        return None, None
+    bech = bech.lower()
+    pos = bech.rfind('1')
+    if pos < 1 or pos + 7 > len(bech) or len(bech) > 90:
+        return None, None
+    if not all(x in _BECH32_CHAR_MAP for x in bech[pos + 1:]):
+        return None, None
+    hrp = bech[:pos]
+    data = [_BECH32_CHAR_MAP[x] for x in bech[pos + 1:]]
+    if not _bech32_verify_checksum(hrp, data):
+        return None, None
+    return hrp, data[:-6]
+
+
+def bech32_encode(hrp, data_5bit):
+    '''Encode a bech32 string given HRP and 5-bit data values (no checksum).'''
+    combined = list(data_5bit) + _bech32_create_checksum(hrp, data_5bit)
+    return hrp + '1' + ''.join([_BECH32_CHARSET[d] for d in combined])
+
+
+def decode_segwit_address(hrp, addr):
+    '''Decode a SegWit address.
+
+    Returns (witver, witprog) where witprog is bytes, or (None, None) on
+    failure.  Only witness version 0 is accepted (v1+ / Taproot not supported).
+    '''
+    hrpgot, data = bech32_decode(addr)
+    if data is None or hrpgot != hrp:
+        return None, None
+    if len(data) < 1:
+        return None, None
+    witver = data[0]
+    if witver != 0:
+        return None, None
+    decoded = _convertbits(data[1:], 5, 8, False)
+    if decoded is None or len(decoded) < 2 or len(decoded) > 40:
+        return None, None
+    if witver == 0 and len(decoded) not in (20, 32):
+        return None, None
+    return witver, bytes(decoded)
+
+
+def encode_segwit_address(hrp, witver, witprog):
+    '''Encode a SegWit address.
+
+    witver must be 0 for v0 (P2WPKH / P2WSH).
+    witprog must be bytes (20 bytes for P2WPKH, 32 bytes for P2WSH).
+    '''
+    ret = bech32_encode(hrp, [witver] + _convertbits(witprog, 8, 5))
+    if decode_segwit_address(hrp, ret) == (None, None):
+        raise ValueError(f'bech32 round-trip failed for {ret!r}')
+    return ret
