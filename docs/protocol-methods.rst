@@ -846,6 +846,141 @@ Return the confirmed and unconfirmed history of a :ref:`script hash
     }
   ]
 
+blockchain.scripthash.get_history_rich
+=====================================
+
+Return one page of classified, display-ready history of a :ref:`script
+hash <script hashes>`, newest first.
+
+This is an Avian extension, not part of the standard protocol.  A server
+that implements it advertises ``"avn_rich_history": 1`` in the result of
+:func:`server.features`; clients that do not see the flag must fall back
+to :func:`blockchain.scripthash.get_history`.
+
+Each row is what a wallet displays, worked out server-side from the
+history index and the transactions it references.  Clients using
+:func:`blockchain.scripthash.get_history` must instead fetch every
+transaction of the address, and the parent transaction of every input of
+each of those, since an input carries neither the address nor the value
+of the output it spends.
+
+**Signature**
+
+  .. function:: blockchain.scripthash.get_history_rich(scripthash, page=0, page_size=25, order="newest")
+
+  *scripthash*
+
+    The script hash as a hexadecimal string.
+
+  *page*
+
+    The zero-based page to return.  A page beyond the end of the history
+    returns an empty *txs* list, not an error.
+
+  *page_size*
+
+    The number of rows per page, from 1 to 100.
+
+  *order*
+
+    ``"newest"`` (the default) sorts mempool transactions first, then by
+    descending block height.  ``"oldest"`` reverses that.
+
+**Result**
+
+  A dictionary with the following keys:
+
+  * *total*
+
+    The number of transactions in the whole history, for paginating
+    without walking it.
+
+  * *page*, *page_size*, *order*
+
+    The arguments the page was built with.
+
+  * *txs*
+
+    The rows of this page.  Each is a dictionary with the following keys,
+    all relative to the queried script hash:
+
+    * *txid*
+
+      The transaction hash in hexadecimal.
+
+    * *height*
+
+      The height of the block the transaction was confirmed in, ``0`` if
+      it is in the mempool with all inputs confirmed, and ``-1`` if it is
+      in the mempool with unconfirmed inputs.
+
+    * *time*
+
+      The timestamp of the block header, in seconds since the epoch.  For
+      a mempool transaction this is when the server first classified it,
+      which approximates when it was first seen.
+
+    * *type*
+
+      ``"send"`` if the script hash funded any input, ``"receive"``
+      otherwise.
+
+    * *amount*
+
+      The net number of satoshis the script hash gained or received, as a
+      positive number.  A send therefore covers both what was paid away
+      and the fee, as Electrum's own history does, and a transaction that
+      only pays the address back (a consolidation) has the fee as its
+      amount.
+
+    * *counterparty*
+
+      The largest other party of the transaction: for a send, the address
+      of the biggest output not paying us; for a receive, the address of
+      the biggest input not funded by us.  ``null`` when there is none -
+      a coinbase, or a script that pays to no standard address.
+
+    * *fee*
+
+      The fee in satoshis, ``0`` for a coinbase, and ``null`` if a parent
+      transaction could not be read and the fee is therefore unknown.
+
+    * *confirmations*
+
+      The number of confirmations, ``0`` for a mempool transaction.
+
+  Amounts are the AVN moving; asset transfers move no AVN, so an asset
+  transaction appears with the fee it paid as its amount.
+
+**Result Example**
+
+::
+
+  {
+    "total": 5247,
+    "page": 0,
+    "page_size": 25,
+    "order": "newest",
+    "txs": [
+      {
+        "txid": "9fbed79a1e970343fcd39f4a2d830a6bde6de0754ed2da70f489d0303ed558ec",
+        "height": 0,
+        "time": 1723500000,
+        "type": "send",
+        "amount": 500022600,
+        "counterparty": "R9HDHYTuwAr3PyRkXrhYgwycrxC7Xja8zs",
+        "fee": 22600,
+        "confirmations": 0
+      }
+    ]
+  }
+
+.. note:: History is display data and is classified by the server, so a
+  client showing it trusts the server for the direction, amount and
+  counterparty of a row.  Nothing that spends coins should be built from
+  these rows; use :func:`blockchain.scripthash.listunspent`, which the
+  client verifies for itself.
+
 blockchain.scripthash.get_mempool
 =================================
 
@@ -1491,6 +1626,12 @@ Return a list of features and services supported by the server.
     there is no pruning limit.  Should be the same as what would
     suffix the letter ``p`` in the IRC real name.
 
+  * *avn_rich_history*
+
+    ``1`` if the server implements
+    :func:`blockchain.scripthash.get_history_rich`.  Absent on servers
+    that do not, which must be treated as not implementing it.
+
 **Example Result**
 
 ::
@@ -1502,7 +1643,8 @@ Return a list of features and services supported by the server.
       "protocol_min": "1.0",
       "pruning": null,
       "server_version": "ElectrumX 1.0.17",
-      "hash_function": "sha256"
+      "hash_function": "sha256",
+      "avn_rich_history": 1
   }
 
 

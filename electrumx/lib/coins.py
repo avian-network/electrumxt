@@ -290,7 +290,8 @@ class Avian(Coin):
     NET = "mainnet"
     XPUB_VERBYTES = bytes.fromhex("0488B21E")
     XPRV_VERBYTES = bytes.fromhex("0488ADE4")
-    P2PKH_VERBYTE = bytes.fromhex("44")
+    # base58Prefixes in Avian's chainparams.cpp: PUBKEY_ADDRESS 60, SCRIPT_ADDRESS 122
+    P2PKH_VERBYTE = bytes.fromhex("3C")
     P2SH_VERBYTES = [bytes.fromhex("7A")]
     WIF_BYTE = bytes.fromhex("80")
     SEGWIT_HRP = "avn"

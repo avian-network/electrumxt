@@ -37,6 +37,8 @@ from electrumx.lib.hash import (sha256, hash_to_hex_str, hex_str_to_hash, HASHX_
 
 from electrumx.server.daemon import DaemonError
 from electrumx.server.peers import PeerManager
+from electrumx.server.rich_history import (DEFAULT_PAGE_SIZE, RichHistory,
+                                           validate_page_args)
 
 if TYPE_CHECKING:
     from electrumx.server.db import DB
@@ -153,6 +155,7 @@ class SessionManager:
         self._merkle_lookups = 0
         self._merkle_hits = 0
         self.estimatefee_cache = pylru.lrucache(1000)
+        self.rich_history = RichHistory(self)
         self.notified_height = None
         self.hsub_results = None
         self._sslc = None
@@ -319,6 +322,7 @@ class SessionManager:
                 self._history_lookups, self._history_hits, len(self._history_cache)),
             'merkle cache': cache_fmt.format(
                 self._merkle_lookups, self._merkle_hits, len(self._merkle_cache)),
+            'rich history cache': cache_fmt.format(*self.rich_history.cache_stats()),
             'pid': os.getpid(),
             'peers': self.peer_mgr.info(),
             'request counts': self._method_counts,
@@ -1072,6 +1076,9 @@ class ElectrumX(SessionBase):
             'genesis_hash': env.coin.GENESIS_HASH,
             'hash_function': 'sha256',
             'services': [str(service) for service in env.report_services],
+            # Advertises blockchain.scripthash.get_history_rich.  Clients that
+            # do not see this flag use the standard get_history path.
+            'avn_rich_history': 1,
         }
 
     async def server_features_async(self):
@@ -1509,6 +1516,22 @@ class ElectrumX(SessionBase):
         '''Return the confirmed and unconfirmed history of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
+
+    async def scripthash_get_history_rich(self, scripthash, page=0,
+                                          page_size=DEFAULT_PAGE_SIZE, order='newest'):
+        '''Return one page of classified, display-ready history of a scripthash.
+
+        Unlike get_history, which returns bare (tx_hash, height) pairs the
+        client must then flesh out with a transaction fetch per entry and a
+        parent fetch per input, each row here comes with its direction, net
+        amount, counterparty, fee and time already worked out.
+        '''
+        hashX = scripthash_to_hashX(scripthash)
+        page, page_size, order = validate_page_args(page, page_size, order)
+        result, cost = await self.session_mgr.rich_history.history_page(
+            hashX, page, page_size, order)
+        self.bump_cost(cost)
+        return result
 
     async def scripthash_get_mempool(self, scripthash):
         '''Return the mempool transactions touching a scripthash.'''
@@ -2176,6 +2199,9 @@ class ElectrumX(SessionBase):
             'blockchain.tag.h160.history': self.qualifications_for_h160_history,
             'blockchain.asset.frozen_history': self.restricted_frozen_history,
             'blockchain.asset.restricted_associations_history': self.lookup_qualifier_associations_history,
+
+            # Avian extension, advertised as avn_rich_history in server.features
+            'blockchain.scripthash.get_history_rich': self.scripthash_get_history_rich,
         }
 
         self.request_handlers = handlers
